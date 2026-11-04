@@ -13,8 +13,8 @@ controls), numbered in the bottom bar like the car:
           pressure)
 Both pages: T Water, V Batt, LaptimeDiff, Speed, Gear, ABS / TC / MAP, Fuel; top row =
 RPM bar (0-8), which becomes "PITSPEED ACTIVE <speed>" with the pit limiter on (blue
-under the limit, red over); bottom bar with the headlight-flash indicator (lights up while
-you flash), rain-light icon and page number; 10 shift lights in the iRacing manual's pattern (outside in: 2 green 6180,
+under the limit, red over); bottom bar with the headlight and rain-light icons, the page
+number, and the blue high-beam light that pops up while you flash the headlights; 10 shift lights in the iRacing manual's pattern (outside in: 2 green 6180,
 4 green 6350, 2 yellow 6520, 4 yellow 6690, 2 red 6860, all red flashing 7030 rpm;
 centre six alternate blue / yellow with the pit limiter on).
 
@@ -76,6 +76,7 @@ LED_YELLOW = "#FFF6E61C"
 LED_RED = "#FFFF2A2A"
 LED_BLUE = "#FF2D6BFF"
 ICON_GREEN = (46, 158, 58)
+ICON_BLUE = (64, 110, 190)
 ICON_ORANGE = (185, 122, 42)
 
 # ── Property paths ─────────────────────────────────────────────
@@ -108,8 +109,11 @@ def ncalc(expr):
     return {"Formula": {"Expression": expr}, "Mode": 2}
 
 
-def js(expr):
-    return {"Formula": {"JSExt": 0, "Interpreter": 1, "Expression": expr}, "Mode": 2}
+def js(expr, pre=None):
+    f = {"JSExt": 0, "Interpreter": 1, "Expression": expr}
+    if pre:
+        f["PreExpression"] = pre  # runs once; its variables persist between evaluations
+    return {"Formula": f, "Mode": 2}
 
 
 def bindings(**kw):
@@ -259,23 +263,34 @@ return (d >= 0 ? '+' : '-') + format(Math.abs(d), '0.00');"""
 
 SPEED_JS = f"return format($prop('{ND}SpeedLocal') || 0, '0');"
 
-# Headlight flash indicator: full brightness while flashing, dim the rest of the time
-HEADLIGHT_DIM = 22
-HEADLIGHT_JS = f"return $prop('{TELE}dcHeadlightFlash') ? 100 : {HEADLIGHT_DIM};"
+# Blue high-beam indicator between the headlight and rain-light icons. iRacing's
+# dcHeadlightFlash is just the flash button (on while held; recorded presses are
+# 0.05-0.2 s, the odd one ~1 s), so the light blinks on its own clock from the moment
+# you press: every press gives at least one full flash, holding keeps it blinking.
+HB_ON_MS = 150
+HIGHBEAM_PRE = "var hbStart = 0, hbLast = -1e9, hbWas = false;"
+HIGHBEAM_JS = f"""var on = !!$prop('{TELE}dcHeadlightFlash'), now = Date.now();
+if (on && !hbWas) hbStart = now;          // new press: start a flash cycle
+hbWas = on;
+if (on) hbLast = now;
+var t = now - hbStart, period = {2 * HB_ON_MS};
+var flashStart = hbStart + Math.floor(t / period) * period;
+// show only flashes that started while the button was held; each runs its full length
+return (t % period) < {HB_ON_MS} && flashStart <= hbLast;"""
 
 FUEL_JS = UNITS_JS + f"""var f = $prop('{ND}Fuel');
 if (f === null || f === undefined) return '-';
 return format(imperial ? f * 0.264172 : f, '0.0');"""
 
 
-def dc_js(names):
+def dc_js(names, fallback="-"):
     lst = ", ".join(f"'{TELE}{n}'" for n in names)
     return f"""var names = [{lst}];
 for (var i = 0; i < names.length; i++) {{
   var v = $prop(names[i]);
   if (v !== null && v !== undefined) return format(v, '0');
 }}
-return '-';"""
+return '{fallback}';"""
 
 
 def tyre_js(corner, what):
@@ -347,6 +362,22 @@ def draw_headlight(w, h):
     for k in range(4):
         y0 = H_ * (0.24 + k * 0.17)
         d.line([(W_ * 0.04, y0 + H_ * 0.05), (W_ * 0.34, y0 - H_ * 0.03)], fill=ICON_GREEN + (255,), width=lw)
+    return im.resize((round(w), round(h)), Image.LANCZOS)
+
+
+def draw_highbeam(w, h):
+    """High-beam symbol: four straight horizontal beams + a 'D' lamp body (blue)."""
+    s = 4
+    im = Image.new("RGBA", (round(w) * s, round(h) * s), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    W_, H_ = im.size
+    lw = max(2, round(W_ * 0.055))
+    body_x = W_ * 0.42
+    d.line([(body_x, H_ * 0.12), (body_x, H_ * 0.88)], fill=ICON_BLUE + (255,), width=lw)
+    d.arc([body_x - W_ * 0.5, H_ * 0.12, W_ * 0.97, H_ * 0.88], -90, 90, fill=ICON_BLUE + (255,), width=lw)
+    for k in range(4):
+        y0 = H_ * (0.22 + k * 0.19)
+        d.line([(W_ * 0.04, y0), (W_ * 0.34, y0)], fill=ICON_BLUE + (255,), width=lw)
     return im.resize((round(w), round(h)), Image.LANCZOS)
 
 
@@ -443,23 +474,28 @@ def build_screen(page):
                      value=("N", S(91), ncalc(f"isnull([{ND}Gear],'N')"), True, None)))
 
     # ABS / TC / MAP
-    for name, (a, b), edge, ph, names in [
-            ("ABS", (335, 377), C_ABS, "10", ["dcABS"]),
-            ("TC", (385, 427), C_TC, "10", ["dcTractionControl"]),
-            ("MAP", (434, 476), C_MAP, "3", ["dcEngineMap", "dcThrottleShape", "dcFuelMixture"])]:
+    # MAP: iRacing has no engine-map channel for this car (not adjustable) and the
+    # in-game dash always shows 3, so 3 is the fallback
+    for name, (a, b), edge, ph, names, fallback in [
+            ("ABS", (335, 377), C_ABS, "10", ["dcABS"], "-"),
+            ("TC", (385, 427), C_TC, "10", ["dcTractionControl"], "-"),
+            ("MAP", (434, 476), C_MAP, "3", ["dcEngineMap", "dcThrottleShape", "dcFuelMixture"], "3")]:
         items.append(box(name, a, 218, b, 275, name, edge=edge,
-                         value=(ph, S(28), js(dc_js(names)), True, None)))
+                         value=(ph, S(28), js(dc_js(names, fallback)), True, None)))
 
     # Fuel
     items.append(box("Fuel", 336, 284, 477, 343, "Fuel",
                      value=("14.0", S(39), js(FUEL_JS), False, "000.0")))
 
-    # Bottom bar: headlight + rain-light icons, page number
+    # Bottom bar: headlight + rain-light icons, page number, and the blue high-beam
+    # light that pops up while flashing (hidden in the editor; the binding shows it)
+    highbeam = image("Highbeam_icon", "amg_highbeam", X(281), Y(361), S(37), S(32),
+                     binds=bindings(Visible=js(HIGHBEAM_JS, pre=HIGHBEAM_PRE)))
+    highbeam["Visible"] = False
     items.append(layer("BottomBar", [
         rect("Bottom_box", X(67), Y(352), S(411), S(52), SCREEN, border=round(S(0.9)), border_color=EDGE),
-        # lit while you flash the headlights (iRacing dcHeadlightFlash), dim otherwise
-        image("Headlight_icon", "amg_headlight", X(234), Y(361), S(40), S(32), opacity=HEADLIGHT_DIM,
-              binds=bindings(Opacity=js(HEADLIGHT_JS))),
+        image("Headlight_icon", "amg_headlight", X(234), Y(361), S(40), S(32)),
+        highbeam,
         image("Rainlight_icon", "amg_rainlight", X(326), Y(361), S(31), S(32)),
         text("PageNumber", X(440), Y(360), S(26), S(20), str(page), S(15), LABEL, halign=2, bold=False),
     ]))
@@ -476,7 +512,8 @@ def build_screen(page):
 
 
 def main():
-    images = {"amg_headlight": draw_headlight(S(40), S(32)), "amg_rainlight": draw_rainlight(S(31), S(32))}
+    images = {"amg_headlight": draw_headlight(S(40), S(32)), "amg_highbeam": draw_highbeam(S(37), S(32)),
+              "amg_rainlight": draw_rainlight(S(31), S(32))}
     meta_images, blobs = [], {}
     for name, im in images.items():
         buf = io.BytesIO()
